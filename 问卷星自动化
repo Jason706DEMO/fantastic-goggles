@@ -1,0 +1,119 @@
+import asyncio
+import random
+from playwright.async_api import async_playwright
+
+# ==================== 配置区域 ====================
+SURVEY_URL = "https://v.wjx.cn/vm/hozL3eL.aspx#"  # 你的企业版问卷链接
+TARGET_COUNT = 50  # 先设置成 50 份测试一下
+# =================================================
+
+FEEDBACK_POOL = [
+    "拼多多买生活用品挺便宜的，配送也快。",
+    "经常和舍友一起拼单买零食，性价比很高。",
+    "有时候质量一般，但胜在价格便宜，学生党完全够用。",
+    "界面活动有点繁琐，不过百亿补贴买数码配件挺划算的。",
+    "感觉挺适合大学生消费水平的，经常有满减活动。",
+    "客服售后处理挺快的，退款很方便。"
+]
+
+async def fill_single_survey(browser, submit_count):
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
+        viewport={"width": 1280, "height": 800}
+    )
+    page = await context.new_page()
+    
+    try:
+        # 1. 打开网页并等待加载
+        await page.goto(SURVEY_URL, timeout=30000)
+        await page.wait_for_selector("#ctlNext", timeout=10000)
+        print(f"[{submit_count}/{TARGET_COUNT}] 网页加载成功，开始自动填写主要题型...")
+        
+        # 2. 模拟全屏快速滑屏（激活部分动态选项）
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2);")
+        await asyncio.sleep(0.3)
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+        await asyncio.sleep(0.3)
+        await page.evaluate("window.scrollTo(0, 0);") 
+        await asyncio.sleep(0.5)
+
+        # 3. 获取所有的题目块
+        questions = await page.query_selector_all(".div_question, .field")
+        
+        for q in questions:
+            if not await q.is_visible():
+                continue
+                
+            # 4. 【自动搞定简答题】
+            textarea = await q.query_selector("textarea, input[type='text']")
+            if textarea and await textarea.is_visible():
+                try:
+                    await textarea.fill(random.choice(FEEDBACK_POOL))
+                except:
+                    pass
+                continue
+
+            # 5. 【专门针对第 9 题：量表/矩阵评分题自动化】
+            # 检查当前题目块内是否存在你提供的 rate-offlarge 元素
+            rate_options = await q.query_selector_all("a.rate-offlarge")
+            if rate_options:
+                try:
+                    # 问卷星的矩阵评分通常按行排列，每一行有 5个 a 标签 (dval=1 到 5)
+                    # 我们按 5 个一组进行切片，模拟每一行独立随机勾选
+                    for i in range(0, len(rate_options), 5):
+                        row_options = rate_options[i:i+5]
+                        if row_options:
+                            target_opt = random.choice(row_options)
+                            await target_opt.scroll_into_view_if_needed(timeout=1000)
+                            await target_opt.click(force=True, timeout=1000)
+                            await asyncio.sleep(random.uniform(0.1, 0.3)) # 模拟人类点击微小延迟
+                    continue # 搞定第 9 题后跳过普通选择器的逻辑
+                except Exception as e:
+                    print(f"处理第 9 题时出现微小摩擦: {e}")
+
+            # 6. 【常规单选多选选择器】
+            options = await q.query_selector_all("a.jqradio, a.jqcheck, label, .wj-radio, .wj-checkbox")
+            if options:
+                valid_options = [opt for opt in options if await opt.is_visible()]
+                if valid_options:
+                    try:
+                        target_opt = random.choice(valid_options)
+                        await target_opt.scroll_into_view_if_needed(timeout=1000)
+                        await target_opt.click(force=True, timeout=1000)
+                    except:
+                        pass
+
+        # 7. 【不再需要人工干预！】
+        # 模拟提交前的最后人类凝视，随机停 1 到 3 秒
+        await asyncio.sleep(random.uniform(1, 3)) 
+
+        # 8. 自动点击提交
+        submit_btn = await page.query_selector("#ctlNext")
+        if submit_btn:
+            await submit_btn.click(force=True)
+            await asyncio.sleep(4) 
+            print(f"✅ 第 {submit_count} 份成功提交！")
+            return True
+        else:
+            print(f"❌ 未能定位到提交按钮。")
+            return False
+
+    except Exception as e:
+        print(f"⚠️ 第 {submit_count} 份出错: {e}")
+        return False
+    finally:
+        await context.close()
+
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False, channel="chrome")
+        success_num = 0
+        for i in range(1, TARGET_COUNT + 1):
+            if await fill_single_survey(browser, i):
+                success_num += 1
+            await asyncio.sleep(random.uniform(3, 5))
+        await browser.close()
+        print(f"🎉 任务结束！成功刷入 {success_num} 份数据。")
+
+if __name__ == "__main__":
+    asyncio.run(main())
