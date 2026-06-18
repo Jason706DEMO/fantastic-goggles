@@ -1,0 +1,165 @@
+import asyncio
+import random
+from playwright.async_api import async_playwright
+
+# ==================== 配置区域 ====================
+SURVEY_URL = "https://v.wjx.cn/vm/hozL3eL.aspx#"  # 你的新问卷链接
+TARGET_COUNT = 5  # 期望成功刷入的份数（测试时先设为 1）
+# =================================================
+
+# ==================== 动态文案生成配置 ====================
+# 通过三维词库随机拼接，可生成 5 * 6 * 5 = 150 句完全不同的评语，彻底规避后台查重
+POOL_START = ["拼多多上", "平时在PDD", "经常在拼多多上", "和舍友一起用拼多多", "感觉拼多多"]
+POOL_CORE = [
+    "买生活用品和零食真的很便宜，配送速度也挺快的",
+    "拼单买点小东西性价比很高，非常适合学生党",
+    "买数码配件或者百亿补贴的东西挺划算的，质量也有保障",
+    "虽然有些衣服质量一般，但胜在价格足够便宜",
+    "搞活动的时候满减力度很大，能省下不少生活费",
+    "售后服务处理得挺快，退换货比较方便，不揪心"
+]
+POOL_END = ["，完全够用了。", "，整体挺满意的。", "，体验还可以。", "，推荐给身边的同学了。", "，性价比确实高。"]
+
+def generate_unique_feedback():
+    """动态生成一句几乎不重复的反馈文案"""
+    return f"{random.choice(POOL_START)}{random.choice(POOL_CORE)}{random.choice(POOL_END)}"
+# =========================================================
+
+async def fill_current_page_questions(page):
+    """负责填写当前可见页面上的所有题目"""
+    # 1. 模拟更自然的向下渐进式滚动，确保触发所有题目和底部按钮的加载
+    for percentage in [0.3, 0.6, 0.9, 1.0]:
+        await page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {percentage});")
+        await asyncio.sleep(0.2)
+    await page.evaluate("window.scrollTo(0, 0);")  # 滚回顶部开始填题
+    await asyncio.sleep(0.3)
+
+    # 获取当前所有的题目块
+    questions = await page.query_selector_all(".div_question, .field")
+    
+    for q in questions:
+        if not await q.is_visible():
+            continue
+            
+        # 2. 自动搞定简答题（调用动态文本）
+        textarea = await q.query_selector("textarea, input[type='text']")
+        if textarea and await textarea.is_visible():
+            try:
+                val = await textarea.input_value()
+                if not val:
+                    await textarea.fill(generate_unique_feedback())
+            except:
+                pass
+            continue
+
+        # 3. 专门针对第 9 题等量表/矩阵评分题自动化
+        rate_options = await q.query_selector_all("a.rate-offlarge")
+        if rate_options:
+            try:
+                for i in range(0, len(rate_options), 5):
+                    row_options = rate_options[i:i+5]
+                    if row_options:
+                        # 检查这行是否已经有选中的（含有 rate-onlarge 类名表示已选）
+                        is_selected = False
+                        for opt in row_options:
+                            cls = await opt.get_attribute("class")
+                            if cls and "rate-onlarge" in cls:
+                                is_selected = True
+                                break
+                        
+                        if not is_selected:
+                            target_opt = random.choice(row_options)
+                            await target_opt.scroll_into_view_if_needed(timeout=1000)
+                            await target_opt.click(force=True, timeout=1000)
+                            await asyncio.sleep(random.uniform(0.1, 0.3)) 
+                continue 
+            except Exception as e:
+                print(f"处理矩阵题时微小摩擦: {e}")
+
+        # 4. 常规单选多选选择器
+        options = await q.query_selector_all("a.jqradio, a.jqcheck, label, .wj-radio, .wj-checkbox")
+        if options:
+            valid_options = [opt for opt in options if await opt.is_visible()]
+            if valid_options:
+                try:
+                    # 简单判断是否已经勾选过，避免多页反复触发
+                    is_filled = False
+                    for opt in valid_options:
+                        cls = await opt.get_attribute("class")
+                        if cls and ("checked" in cls or "on" in cls):
+                            is_filled = True
+                            break
+                    
+                    if not is_filled:
+                        target_opt = random.choice(valid_options)
+                        await target_opt.scroll_into_view_if_needed(timeout=1000)
+                        await target_opt.click(force=True, timeout=1000)
+                except:
+                    pass
+
+async def fill_single_survey(browser, submit_count):
+    # 配置 Edge 浏览器的 User-Agent 伪装
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+        viewport={"width": 1280, "height": 800}
+    )
+    page = await context.new_page()
+    
+    try:
+        # 打开网页并等待基础框架加载
+        await page.goto(SURVEY_URL, timeout=30000)
+        await page.wait_for_selector("#divPowerBy", timeout=10000, state="attached")
+        print(f"[{submit_count}/{TARGET_COUNT}] 网页加载成功，开始处理新版多页问卷...")
+        
+        page_index = 1
+        while True:
+            print(f"-> 正在填写第 {page_index} 页...")
+            # 自动填写当前页题目
+            await fill_current_page_questions(page)
+            
+            # 填完题后探底滚动，强制让底部按钮渲染显示
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+            await asyncio.sleep(0.5)
+
+            # 准确定位新版问卷特有的“下一页”按钮元素
+            next_page_btn = page.locator('a.button:has-text("下一页")')
+            
+            # 模拟人类在点击前的习惯性停顿
+            await asyncio.sleep(random.uniform(1, 2))
+            
+            # 判断当前是有“下一页”还是到了最后一页
+            if await next_page_btn.is_visible():
+                await next_page_btn.click(force=True)
+                print(f"-> 第 {page_index} 页填完，成功点击【下一页】")
+                await asyncio.sleep(2.0)  # 给下一页的题目加载留出缓冲时间
+                page_index += 1
+            else:
+                # 找不到“下一页”按钮，说明来到了最后一页，准备寻找最终的提交按钮
+                print(f"-> 未检测到【下一页】按钮，判定已到达最后一页。准备提交...")
+                submit_btn = await page.wait_for_selector("#ctlNext", timeout=5000, state="visible")
+                await submit_btn.click(force=True)
+                await asyncio.sleep(4)  # 等待提交接口完成响应
+                print(f"✅ 第 {submit_count} 份成功提交！")
+                return True
+
+    except Exception as e:
+        print(f"⚠️ 第 {submit_count} 份出错: {e}")
+        return False
+    finally:
+        await context.close()
+
+async def main():
+    async with async_playwright() as p:
+        # channel="msedge" 会直接调用你电脑里安装好的 Edge 浏览器内核
+        browser = await p.chromium.launch(headless=False, channel="msedge")
+        success_num = 0
+        for i in range(1, TARGET_COUNT + 1):
+            if await fill_single_survey(browser, i):
+                success_num += 1
+            # 既然问卷变长了，每份之间的休息时间也建议稍微拉长，降低被风控概率
+            await asyncio.sleep(random.uniform(5, 8))
+        await browser.close()
+        print(f"🎉 任务结束！成功刷入 {success_num} 份数据。")
+
+if __name__ == "__main__":
+    asyncio.run(main())
